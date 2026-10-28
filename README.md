@@ -2,7 +2,7 @@
 
 把 [grok-ball](https://github.com/tycoding/grok-ball) 的 Grok 小球表情动画移植到 **HoloCubic**（320×240 横屏 / Lua + LVGL）的前台应用。
 
-纯 Lua 实现，不需要编译，也不依赖任何图片素材——球体、眼睛、睡眠字母、撒花全部在 LVGL canvas 上逐帧实时绘制。待机 15 秒不动，它会自己开始轮播 32 套表情。
+纯 Lua 实现，不需要编译，也不依赖任何图片素材——球体、眼睛、睡眠字母、撒花全部在 LVGL canvas 上逐帧实时绘制。启动后按 `00 → 01 → … → 41 → 00` 的顺序循环播放全部 32 套表情，每个停 5.2 秒，一圈约 2.8 分钟。
 
 ![预览](preview.png)
 
@@ -40,7 +40,7 @@
 | `↓` | 弹跳 |
 | `HOME` | 退出应用 |
 
-无操作 15 秒后自动巡演，每 5.2 秒换一个表情；按任意方向键即退出巡演、回到手动模式。
+默认开启轮播（`autoplay = true`）：启动即从 `00` 开始按顺序循环。按方向键可随时手动跳转，跳过去之后新表情同样停满一个周期再继续往下走。把 `autoplay` 设为 `false` 则回到「15 秒无操作才开始轮播」的行为。
 
 ## 安装
 
@@ -89,10 +89,11 @@ curl -X POST "http://$DEV/devtools/api/apps/rescan"   # 让 launcher 重新扫�
 | `radius` | `84` | 球半径（像素），球直径 = `2*radius` |
 | `bg` | `0x0B0C10` | 背景色 |
 | `interval` | `33` | 重绘间隔 ms（≈30fps） |
-| `start_emotion` | `"02"` | 启动表情 id |
+| `autoplay` | `true` | 启动即按顺序循环播放全部表情 |
+| `start_emotion` | `"00"` | 轮播起点 id |
 | `fallback_emotion` | `"02"` | id 找不到时的回退表情 |
-| `tour_delay` | `15000` | 多久无操作后开始自动巡演（ms） |
-| `tour_step` | `5200` | 巡演时每个表情停留多久（ms） |
+| `tour_step` | `5200` | 每个表情停留多久（ms），32 个一轮约 2.8 分钟 |
+| `tour_delay` | `15000` | 仅 `autoplay = false` 时生效：无操作多久后开始轮播（ms） |
 | `hint` | `<> switch   ^ spin   v bounce` | 启动时底部提示文字，4.5 秒后自动换成 `当前 id / 32` |
 | `snapshot_ms` | `nil` | 调试：设为毫秒数，启动后把屏幕导出为 `shot.png` |
 | `perf_log` | `false` | 调试：每 `perf_frames` 帧往 `perf.txt` 写一行 fps |

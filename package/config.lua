@@ -7,11 +7,12 @@ return {
   bg = 0x0B0C10,        -- 背景色
   interval = 33,        -- 重绘间隔 ms（实测 33ms ≈ 30fps，单帧占用约 17ms）
 
-  -- 表情
-  start_emotion = "02", -- 启动表情（02 待机放空）
-  fallback_emotion = "02",
-  tour_delay = 15000,   -- 多久无操作后开始自动巡演
-  tour_step = 5200,     -- 巡演时每个表情停留时长
+  -- 表情轮播
+  autoplay = true,      -- true：启动即按顺序循环播放全部 32 套表情
+  start_emotion = "00", -- 轮播起点（00 睡眠 → 01 唤醒 → … → 41 → 回到 00）
+  fallback_emotion = "02", -- id 不存在时的回退表情
+  tour_step = 5200,     -- 每个表情停留时长 ms（一轮 32 个约 2.8 分钟）
+  tour_delay = 15000,   -- 仅 autoplay=false 时生效：无操作多久后开始巡演
 
   hint = "<> switch   ^ spin   v bounce",
 

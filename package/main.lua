@@ -101,8 +101,15 @@ local function switch_to(id, touch)
   if not engine then return end
   engine:set_emotion(id)
   if touch then
-    APP.last_input = millis_now()
-    APP.tour_next = APP.last_input + (config.tour_delay or 15000) + (config.tour_step or 5200)
+    -- 手动切表情后，让新表情完整停留一个周期
+    local now = millis_now()
+    APP.last_input = now
+    local step_ms = config.tour_step or 5200
+    if config.autoplay then
+      APP.tour_next = now + step_ms
+    else
+      APP.tour_next = now + (config.tour_delay or 15000) + step_ms
+    end
   end
 end
 
@@ -159,10 +166,15 @@ end
 local function frame()
   local now = millis_now()
   local frame_us = now_us()
-  local tour_delay = config.tour_delay or 15000
 
-  -- 自动巡演：久无操作时轮流展示全部表情
-  if now - APP.last_input >= tour_delay and now >= APP.tour_next then
+  -- 轮播：autoplay 时启动即按顺序循环；否则久无操作后才开始巡演
+  local due
+  if config.autoplay then
+    due = true
+  else
+    due = (now - APP.last_input) >= (config.tour_delay or 15000)
+  end
+  if due and now >= APP.tour_next then
     step(1, false)
     APP.tour_next = now + (config.tour_step or 5200)
   end
@@ -181,7 +193,7 @@ local function frame()
     local def = engine:emotion()
     if now - start_ms >= 4500 and APP.shown_id ~= def.id then
       APP.shown_id = def.id
-      set_hint(string.format("%s / %d", def.id, #engine.list), 0x4A4C52)
+      set_hint(string.format("%s  %d/%d", def.id, index_of(def.id), #engine.list), 0x4A4C52)
     end
   end
 
@@ -252,7 +264,13 @@ local function start()
 
   start_ms = millis_now()
   APP.last_input = start_ms
-  APP.tour_next = start_ms + (config.tour_delay or 15000) + (config.tour_step or 5200)
+  local step_ms = config.tour_step or 5200
+  if config.autoplay then
+    -- 启动即轮播：让第一个表情也完整停留一个周期
+    APP.tour_next = start_ms + step_ms
+  else
+    APP.tour_next = start_ms + (config.tour_delay or 15000) + step_ms
+  end
   APP.perf = { n = 0, cost = 0, eng = 0, wall = now_us() / 1000 }
 
   if key and key.on then
