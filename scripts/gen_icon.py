@@ -7,13 +7,15 @@
 """
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 from PIL import Image, ImageDraw
 
 HERE = Path(__file__).resolve().parent
 PKG = HERE.parent / "package"
-SRC = HERE.parent.parent.parent / "grok-ball" / "src" / "grok-ball.js"
+DEFAULT_SRC = HERE.parent.parent.parent / "grok-ball" / "src" / "grok-ball.js"
+SRC = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else DEFAULT_SRC
 
 EXPR_INDEX = 10
 SIZE = 128
