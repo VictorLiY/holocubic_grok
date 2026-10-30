@@ -7,13 +7,27 @@
 --     缩放，眼睛越靠上下越扁。
 --   * LVGL canvas 没有填充多边形图元，这里用扫描线算法把多边形拆成横向
 --     线段（draw_line），48 点 / 每帧两条眼睛约 80 次调用。
+--
+-- 精细度（config.antialias）：
+--   * 球体用 16 级径向渐变分层叠画，色阶差 ≤1，取代原来 5 层的大色带；
+--   * 球缘逐行做覆盖率混色（set_px_color），消除 1px 台阶；
+--   * 眼缘左右各有 1 个像素按覆盖率与球面底色混色，顶末行再叠纵向覆盖率。
 
 local Ball = {}
 Ball.__index = Ball
 
-local floor, sqrt, sin, cos, abs = math.floor, math.sqrt, math.sin, math.cos, math.abs
+local floor, ceil, sqrt, sin, cos, abs = math.floor, math.ceil, math.sqrt, math.sin, math.cos, math.abs
 local TAU = math.pi * 2
 local RING_POINTS = 48
+
+-- 高光方向（球半径为单位，屏幕 y 向下）：左上
+local HL_X, HL_Y = -0.30, -0.42
+-- 径向渐变的色阶数（越大越平滑，代价是每帧多画几层圆）
+local GRAD_STEPS = 16
+-- 高光最亮处的提亮幅度（朝白色靠拢的比例）
+local HL_AMT = 0.26
+-- 覆盖率量化级数（抗锯齿混色查表用，越大边缘过渡越细）
+local COV_LEVELS = 16
 
 local lv_canvas_frame_begin = rawget(_G, "lv_canvas_frame_begin") or rawget(_G, "lv_canvas_begin")
 local lv_canvas_frame_end = rawget(_G, "lv_canvas_frame_end") or rawget(_G, "lv_canvas_end")
@@ -22,8 +36,11 @@ local lv_canvas_draw_rect = rawget(_G, "lv_canvas_draw_rect")
 local lv_canvas_draw_line = rawget(_G, "lv_canvas_draw_line")
 local lv_canvas_draw_arc = rawget(_G, "lv_canvas_draw_arc")
 local lv_canvas_draw_text = rawget(_G, "lv_canvas_draw_text")
+local lv_canvas_set_px_color = rawget(_G, "lv_canvas_set_px_color")
 local lv_obj_invalidate = rawget(_G, "lv_obj_invalidate")
 local LV_RADIUS_CIRCLE = rawget(_G, "LV_RADIUS_CIRCLE") or 0x7FFF
+-- 没有 set_px_color 就没有抗锯齿（退回逐行线段填充）
+local HAS_PX = lv_canvas_set_px_color ~= nil
 
 local CONFETTI_COLORS = { 0xF9705C, 0x5B95F0, 0x3FBE86, 0xF5B13F, 0x9A72EE, 0x35C3BD }
 
@@ -68,7 +85,8 @@ local function shade_channel(v, amt)
   return floor(v + (target - v) * a + 0.5) % 256
 end
 
--- 返回 {base, light, rim, stroke} 四个整型色值，按 hex 缓存
+-- 返回 {base, rim, pal[0..GRAD_STEPS], pal_r/g/b, rim_r/g/b} ，按 hex 缓存
+--   pal[i]  径向渐变第 i 层（0 = 球缘底色，GRAD_STEPS = 高光最亮处）
 local function color_set(hex)
   local set = color_cache[hex]
   if set then return set end
@@ -76,62 +94,123 @@ local function color_set(hex)
   local function pack(rr, gg, bb)
     return rr * 65536 + gg * 256 + bb
   end
-  -- 5 级高光：叠画同心圆近似径向渐变，色差控制在 1~2 个色阶，看不出分层
-  local tints = {}
-  for i = 1, 5 do
-    local amt = i * 0.042
-    tints[i] = pack(shade_channel(r, amt), shade_channel(g, amt), shade_channel(b, amt))
+  -- 径向渐变：提亮幅度按 t^1.35 分布，越靠高光中心越亮
+  local pal, pr, pg, pb = {}, {}, {}, {}
+  for i = 0, GRAD_STEPS do
+    local t = i / GRAD_STEPS
+    local amt = HL_AMT * t ^ 1.35
+    local rr = shade_channel(r, amt)
+    local gg = shade_channel(g, amt)
+    local bb = shade_channel(b, amt)
+    pal[i] = pack(rr, gg, bb)
+    pr[i], pg[i], pb[i] = rr, gg, bb
   end
+  local rim_r = shade_channel(r, -0.06)
+  local rim_g = shade_channel(g, -0.06)
+  local rim_b = shade_channel(b, -0.06)
   set = {
     base = pack(r, g, b),
-    tints = tints,
-    rim = pack(shade_channel(r, -0.05), shade_channel(g, -0.05), shade_channel(b, -0.05)),
+    base_r = r, base_g = g, base_b = b,
+    pal = pal,
+    pal_r = pr, pal_g = pg, pal_b = pb,
+    rim = pack(rim_r, rim_g, rim_b),
+    rim_r = rim_r, rim_g = rim_g, rim_b = rim_b,
     stroke = pack(shade_channel(r, -0.6), shade_channel(g, -0.6), shade_channel(b, -0.6)),
   }
   color_cache[hex] = set
   return set
 end
 
+-- 混色：把 src 以 a 的覆盖率覆盖到 dst 上，返回整型色值
+local function mix_pack(dr, dg, db, sr, sg, sb, a)
+  if a <= 0 then return dr * 65536 + dg * 256 + db end
+  if a >= 1 then return sr * 65536 + sg * 256 + sb end
+  local ia = 1 - a
+  return floor(dr * ia + sr * a + 0.5) * 65536
+    + floor(dg * ia + sg * a + 0.5) * 256
+    + floor(db * ia + sb * a + 0.5)
+end
+
+-- 覆盖率量化查表：cov ∈ [0,1] → lut[0..COV_LEVELS]
+local function build_cov_lut(lut, dr, dg, db, sr, sg, sb)
+  for k = 0, COV_LEVELS do
+    lut[k] = mix_pack(dr, dg, db, sr, sg, sb, k / COV_LEVELS)
+  end
+end
+
+local function cov_index(c)
+  local k = floor(c * COV_LEVELS + 0.5)
+  if k < 0 then return 0 elseif k > COV_LEVELS then return COV_LEVELS end
+  return k
+end
+
 -- ---------------------------------------------------------------- 多边形填充
 
 -- 扫描线填充：把闭合折线 (xs, ys) 按行拆成水平线段
-local function fill_poly(cvs, xs, ys, n, color, cross)
+--   lut 为 nil 时用整数端点直接画（旧行为，无抗锯齿）；
+--   否则左右各 1 个边界像素按覆盖率查 lut 混色，首末行再叠一次纵向覆盖率。
+local function fill_poly(cvs, xs, ys, n, color, cross, lut)
   local ymin, ymax = ys[1], ys[1]
   for i = 2, n do
     local y = ys[i]
     if y < ymin then ymin = y elseif y > ymax then ymax = y end
   end
-  local y0 = floor(ymin + 0.5)
-  local y1 = floor(ymax + 0.5)
-  if y1 < y0 then return end
+  local ya = floor(ymin)
+  local yb = ceil(ymax) - 1
+  if yb < ya then return end
+  local set_px = (lut and HAS_PX) and lv_canvas_set_px_color or nil
 
-  for y = y0, y1 do
-    local yy = y + 0.5
-    local cnt = 0
-    local j = n
-    for i = 1, n do
-      local ya, yb = ys[j], ys[i]
-      if (ya <= yy and yb > yy) or (yb <= yy and ya > yy) then
-        cnt = cnt + 1
-        cross[cnt] = xs[j] + (yy - ya) * (xs[i] - xs[j]) / (yb - ya)
-      end
-      j = i
-    end
-    if cnt >= 2 then
-      -- 插入排序，交点通常只有 2~4 个
-      for i = 2, cnt do
-        local v, k = cross[i], i - 1
-        while k >= 1 and cross[k] > v do
-          cross[k + 1] = cross[k]
-          k = k - 1
+  for y = ya, yb do
+    -- 纵向覆盖率：只有首末两行小于 1
+    local ylo = y > ymin and y or ymin
+    local yhi = (y + 1) < ymax and (y + 1) or ymax
+    local vcov = yhi - ylo
+    if vcov > 0.02 then
+      if vcov > 1 then vcov = 1 end
+      local yy = y + 0.5
+      if yy < ymin then yy = ymin + 0.001 elseif yy > ymax then yy = ymax - 0.001 end
+
+      local cnt = 0
+      local j = n
+      for i = 1, n do
+        local ya2, yb2 = ys[j], ys[i]
+        if (ya2 <= yy and yb2 > yy) or (yb2 <= yy and ya2 > yy) then
+          cnt = cnt + 1
+          cross[cnt] = xs[j] + (yy - ya2) * (xs[i] - xs[j]) / (yb2 - ya2)
         end
-        cross[k + 1] = v
+        j = i
       end
-      for i = 1, cnt - 1, 2 do
-        local xa = floor(cross[i] + 0.5)
-        local xb = floor(cross[i + 1] + 0.5)
-        if xb >= xa then
-          lv_canvas_draw_line(cvs, xa, y, xb, y, color, 255, 1)
+      if cnt >= 2 then
+        -- 插入排序，交点通常只有 2~4 个
+        for i = 2, cnt do
+          local v, k = cross[i], i - 1
+          while k >= 1 and cross[k] > v do
+            cross[k + 1] = cross[k]
+            k = k - 1
+          end
+          cross[k + 1] = v
+        end
+        for i = 1, cnt - 1, 2 do
+          local xa, xb = cross[i], cross[i + 1]
+          if set_px then
+            local pl, pr = floor(xa), floor(xb)
+            if pr <= pl then
+              local k = cov_index((xb - xa) * vcov)
+              if k > 0 then set_px(cvs, pl, y, lut[k]) end
+            else
+              set_px(cvs, pl, y, lut[cov_index((pl + 1 - xa) * vcov)])
+              if pr - 1 > pl then
+                lv_canvas_draw_line(cvs, pl + 1, y, pr - 1, y, color, floor(vcov * 255 + 0.5), 1)
+              end
+              set_px(cvs, pr, y, lut[cov_index((xb - pr) * vcov)])
+            end
+          else
+            local sa = floor(xa + 0.5)
+            local sb = floor(xb + 0.5)
+            if sb >= sa then
+              lv_canvas_draw_line(cvs, sa, y, sb, y, color, 255, 1)
+            end
+          end
         end
       end
     end
@@ -139,6 +218,16 @@ local function fill_poly(cvs, xs, ys, n, color, cross)
 end
 
 -- ---------------------------------------------------------------- Ball
+
+-- 弹跳幅度系数：球心到屏幕顶的余量决定能跳多高，球放大后自动收敛，避免出画布
+-- max_h 是引擎里最大弹跳高度（世界坐标，见 grok_engine 的 BOUNCE_SEGS）
+function Ball.bounce_scale(D, radius, cy, max_h)
+  local s = radius / (D.HEAD_C or 114.271)
+  local headroom = cy - radius - 2
+  local v = headroom / ((max_h or 48) * s)
+  if v < 0 then return 0 elseif v > 1 then return 1 end
+  return v
+end
 
 function Ball.new(cvs, D, opts)
   opts = opts or {}
@@ -151,9 +240,13 @@ function Ball.new(cvs, D, opts)
   self.RW = D.HEAD_C
   self.face = D.FACE
   self.cx = opts.cx or 160
-  self.cy = opts.cy or 126
-  self.scale = (opts.radius or 84) / D.HEAD_C
+  self.cy = opts.cy or 116
+  self.scale = (opts.radius or 96) / D.HEAD_C
   self.bg = opts.bg or 0x0B0C10
+  self.bg_r = floor(self.bg / 65536) % 256
+  self.bg_g = floor(self.bg / 256) % 256
+  self.bg_b = self.bg % 256
+  self.aa = (opts.antialias ~= false) and HAS_PX
 
   -- 复用缓冲：每帧只写值，不新建表
   self.xs = { {}, {} }
@@ -166,6 +259,9 @@ function Ball.new(cvs, D, opts)
   end
   self.cross = {}
   self.confetti = {}
+  self.lut = {}          -- 眼睛边缘混色表
+  self.rim_lut = {}      -- 球缘混色表
+  self.rim_col = nil
   self.text_dsc = { color = 0xA8A296, opa = 255, font_size = 14 }
   self.rect_dsc = { bg_color = 0, bg_opa = 255, radius = LV_RADIUS_CIRCLE, border_width = 0 }
   self.prof = { bg = 0, body = 0, eye = 0, fx = 0, n = 0 }
@@ -352,6 +448,91 @@ function Ball:update_confetti(dt)
   end
 end
 
+-- ---------------------------------------------------------------- 球体
+
+-- 叠一层半径 rr、圆心 (x,y) 的实心圆（radius = LV_RADIUS_CIRCLE）
+local function fill_disc(cvs, dsc, x, y, rr, color)
+  dsc.bg_color = color
+  local d = floor(rr * 2 + 0.5)
+  lv_canvas_draw_rect(cvs, floor(x - rr + 0.5), floor(y - rr + 0.5), d, d, dsc)
+end
+
+-- 球体：外圈暗边 + 主体 + GRAD_STEPS 级径向渐变（高光在左上）
+-- 各层都是内接圆：圆心随层号向高光中心移动、半径同步缩小，所以永远不越界。
+-- 返回 LVGL 量化后的外接圆心与半径：AA 边缘必须用同一套几何，否则会差半像素
+-- 而在球缘留下孤立的亮像素。
+function Ball:draw_body(cvs, bcx, bcy, rad, col)
+  local dsc = self.rect_dsc
+  local dd = floor(rad * 2 + 0.5)
+  local ox = floor(bcx - rad + 0.5)
+  local oy = floor(bcy - rad + 0.5)
+
+  dsc.bg_color = col.rim
+  lv_canvas_draw_rect(cvs, ox, oy, dd, dd, dsc)
+
+  fill_disc(cvs, dsc, bcx, bcy, rad * 0.985, col.base)
+
+  local pal = col.pal
+  for i = 1, GRAD_STEPS do
+    local t = i / GRAD_STEPS
+    fill_disc(cvs, dsc, bcx + HL_X * rad * t, bcy + HL_Y * rad * t, rad * (1 - t), pal[i])
+  end
+  return ox + dd * 0.5, oy + dd * 0.5, dd * 0.5
+end
+
+-- 球缘抗锯齿：逐行按覆盖率把边缘像素与背景混色
+function Ball:aa_rim(bcx, bcy, rad, col)
+  local lut = self.rim_lut
+  if self.rim_col ~= col then
+    self.rim_col = col
+    build_cov_lut(lut, self.bg_r, self.bg_g, self.bg_b, col.rim_r, col.rim_g, col.rim_b)
+  end
+  local set_px = lv_canvas_set_px_color
+  local ytop, ybot = bcy - rad, bcy + rad
+  for y = floor(ytop), floor(ybot) do
+    local dyc = y + 0.5 - bcy
+    if abs(dyc) < rad then
+      local hw = sqrt(rad * rad - dyc * dyc)
+      local xl, xr = bcx - hw, bcx + hw
+      local vcov = 1
+      if y < ytop then vcov = y + 1 - ytop end
+      if y + 1 > ybot then vcov = ybot - y end
+      if vcov > 0.02 then
+        if vcov > 1 then vcov = 1 end
+        local pl, pr = floor(xl), floor(xr)
+        if vcov >= 0.999 then
+          set_px(self.cvs, pl, y, lut[cov_index(pl + 1 - xl)])
+          set_px(self.cvs, pr, y, lut[cov_index(xr - pr)])
+        else
+          -- 顶部/底部的行：整行按纵向覆盖率混色
+          for x = pl, pr do
+            local cov = vcov
+            if x == pl then cov = cov * (pl + 1 - xl) end
+            if x == pr then cov = cov * (xr - pr) end
+            if cov > 0.02 then set_px(self.cvs, x, y, lut[cov_index(cov)]) end
+          end
+        end
+      end
+    end
+  end
+end
+
+-- 球面某点的底色 RGB：自最内层向外找它落在哪一级渐变里（每帧两次，可忽略）
+function Ball:shade_rgb(px, py, bcx, bcy, rad, col)
+  local pal_r, pal_g, pal_b = col.pal_r, col.pal_g, col.pal_b
+  for i = GRAD_STEPS, 1, -1 do
+    local t = i / GRAD_STEPS
+    local cx = bcx + HL_X * rad * t
+    local cy = bcy + HL_Y * rad * t
+    local rr = rad * (1 - t)
+    local dx, dy = px - cx, py - cy
+    if dx * dx + dy * dy <= rr * rr then
+      return pal_r[i], pal_g[i], pal_b[i]
+    end
+  end
+  return pal_r[0], pal_g[0], pal_b[0]
+end
+
 -- ---------------------------------------------------------------- 主渲染
 
 function Ball:render(pose, now, dt)
@@ -371,39 +552,33 @@ function Ball:render(pose, now, dt)
   local bcy = self.cy + b.y * s
   local col = color_set(b.color)
 
-  -- 身体：外圈稍暗 + 主体 + 左上高光，近似原 SVG 的三段径向渐变
-  local dsc = self.rect_dsc
-
-  dsc.bg_color = col.rim
-  lv_canvas_draw_rect(cvs, floor(bcx - rad + 0.5), floor(bcy - rad + 0.5),
-    floor(rad * 2 + 0.5), floor(rad * 2 + 0.5), dsc)
-
-  local r2 = rad * 0.985
-  dsc.bg_color = col.base
-  lv_canvas_draw_rect(cvs, floor(bcx - r2 + 0.5), floor(bcy - r2 + 0.5),
-    floor(r2 * 2 + 0.5), floor(r2 * 2 + 0.5), dsc)
-
-  -- 高光：自 0.87r 向内叠 5 层，圆心随半径缩小向左上偏移
-  local tints = col.tints
-  for i = 1, 5 do
-    local f = 1 - i * 0.13
-    local rr = rad * f
-    local off = 1 - f
-    dsc.bg_color = tints[i]
-    lv_canvas_draw_rect(cvs,
-      floor(bcx - rad * 0.24 * off - rr + 0.5),
-      floor(bcy - rad * 0.36 * off - rr + 0.5),
-      floor(rr * 2 + 0.5), floor(rr * 2 + 0.5), dsc)
-  end
+  local ex, ey, er = self:draw_body(cvs, bcx, bcy, rad, col)
+  if self.aa then self:aa_rim(ex, ey, er, col) end
   local t2 = now_us()
 
   -- 眼睛
   local yaw = b.yaw or 0
-  if pose.ringL and self:project_eye(pose.left, pose.ringL, b, yaw, 1) then
-    fill_poly(cvs, self.xs[1], self.ys[1], RING_POINTS, color_set(pose.left.color).base, self.cross)
-  end
-  if pose.ringR and self:project_eye(pose.right, pose.ringR, b, yaw, 2) then
-    fill_poly(cvs, self.xs[2], self.ys[2], RING_POINTS, color_set(pose.right.color).base, self.cross)
+  local lut = self.lut
+  for e = 1, 2 do
+    local pe = e == 1 and pose.left or pose.right
+    local ring = e == 1 and pose.ringL or pose.ringR
+    if ring and self:project_eye(pe, ring, b, yaw, e) then
+      local xs, ys = self.xs[e], self.ys[e]
+      local ec = color_set(pe.color)
+      if self.aa then
+        -- 眼缘像素的混色目标是球面底色：取眼睛中点的采样即可
+        local sumx, sumy = 0, 0
+        for i = 1, RING_POINTS do
+          sumx = sumx + xs[i]
+          sumy = sumy + ys[i]
+        end
+        local nr, ng, nb = self:shade_rgb(sumx / RING_POINTS, sumy / RING_POINTS, bcx, bcy, rad, col)
+        build_cov_lut(lut, nr, ng, nb, ec.base_r, ec.base_g, ec.base_b)
+        fill_poly(cvs, xs, ys, RING_POINTS, ec.base, self.cross, lut)
+      else
+        fill_poly(cvs, xs, ys, RING_POINTS, ec.base, self.cross)
+      end
+    end
   end
   local t3 = now_us()
 

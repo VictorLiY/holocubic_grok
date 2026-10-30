@@ -65,6 +65,7 @@ local APP = {
   stopped = false,
   last_input = 0,
   tour_next = 0,
+  tour_idx = 1,      -- 巡演游标（engine.list 的下标），显式维护，避免被表情自身跳转带偏
   shown_id = nil,
 }
 _G.__grok_bot = APP
@@ -100,6 +101,7 @@ end
 local function switch_to(id, touch)
   if not engine then return end
   engine:set_emotion(id)
+  APP.tour_idx = index_of(id)
   if touch then
     -- 手动切表情后，让新表情完整停留一个周期
     local now = millis_now()
@@ -116,7 +118,8 @@ end
 local function step(delta, touch)
   if not engine then return end
   local list = engine.list
-  local i = index_of(engine:emotion_id())
+  -- 用游标而不是"当前表情 id"：表情自身若跳到别处（settle.next），巡演顺序也不会乱
+  local i = APP.tour_idx or index_of(engine:emotion_id())
   i = (i - 1 + delta) % #list + 1
   switch_to(list[i].id, touch)
 end
@@ -174,6 +177,8 @@ local function frame()
   else
     due = (now - APP.last_input) >= (config.tour_delay or 15000)
   end
+  -- 巡演掌舵期间关掉表情自带的 settle.next，否则 01/07 收尾会跳到 02
+  engine.follow_settle = not due
   if due and now >= APP.tour_next then
     step(1, false)
     APP.tour_next = now + (config.tour_step or 5200)
@@ -249,21 +254,30 @@ local function start()
   set_hint(config.hint or "<> switch   ^ spin   v bounce", 0x6E7076)
   pcall(lv_obj_align, hint, LV_ALIGN_BOTTOM_MID or 0, 0, -5)
 
+  local radius = config.radius or 96
+  local cy = config.cy or 116
+
   ball = Ball.new(canvas, D, {
     cx = config.cx or 160,
-    cy = config.cy or 124,
-    radius = config.radius or 84,
+    cy = cy,
+    radius = radius,
     bg = config.bg or 0x0B0C10,
+    antialias = config.antialias,
   })
+
+  -- 弹跳幅度按球心到屏幕顶的余量自动收缩，球变大后也不会被切掉
+  local bounce_scale = config.bounce_scale or Ball.bounce_scale(D, radius, cy)
 
   engine = Engine.new(D, {
     emotion = config.start_emotion or "02",
     fallback = config.fallback_emotion or "02",
     seed = (millis() % 1000) / 10,
+    bounce_scale = bounce_scale,
   })
 
   start_ms = millis_now()
   APP.last_input = start_ms
+  APP.tour_idx = index_of(engine:emotion_id())
   local step_ms = config.tour_step or 5200
   if config.autoplay then
     -- 启动即轮播：让第一个表情也完整停留一个周期

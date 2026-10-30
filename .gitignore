@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# 离线预览工具的依赖（npm install fengari）
+node_modules/

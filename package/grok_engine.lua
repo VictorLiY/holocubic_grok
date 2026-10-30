@@ -314,6 +314,19 @@ function Engine.new(D, opts)
   self._ringSpring = { x = 1, v = 0, t = 1 }
   self._ringSpeed = 7
 
+  -- 弹跳高度系数：球放大后按屏幕余量收缩，避免跳出画布
+  local bs = opts.bounce_scale
+  if bs and bs ~= 1 then
+    local segs, total = {}, 0
+    for i = 1, #BOUNCE_SEGS do
+      segs[i] = { h = BOUNCE_SEGS[i].h * bs, d = BOUNCE_SEGS[i].d }
+      total = total + segs[i].d
+    end
+    self._bounceSegs, self._bounceTotal = segs, total
+  else
+    self._bounceSegs, self._bounceTotal = BOUNCE_SEGS, BOUNCE_TOTAL
+  end
+
   self._open = { x = 1, v = 0, t = 1 }
   self._blinkQ = {}
   self._blinkNext = huge
@@ -329,6 +342,10 @@ function Engine.new(D, opts)
   self._emoStart = 0
   self._transStart = 0
   self._transDur = 0
+
+  -- 序列表情的 settle={next=...} 是否自动切下一个表情。
+  -- 巡演（main.lua 的顺序轮播）会把它关掉，否则 01/07 收尾跳到 02 会把巡演打回开头。
+  self.follow_settle = opts.follow_settle ~= false
 
   self._dt = 1 / 60
   self._lastTick = 0
@@ -458,10 +475,11 @@ function Engine:_seq_pose(t, now)
         self._transDur = self._def.transition or 500
         self._seq = nil
         return nil
-      elseif type(settle) == "table" and settle.next then
+      elseif type(settle) == "table" and settle.next and self.follow_settle then
         self:set_emotion(settle.next, true)
         return "switch"
       end
+      -- follow_settle = false（巡演中）时按 "hold" 处理：停在末帧，等巡演自己往下走
     end
     return last
   end
@@ -602,8 +620,8 @@ function Engine:_compose(now, depth)
   -- 弹跳：4 段递减抛物线
   if self._bounceAt >= 0 then
     local be = (now - self._bounceAt) / 1000
-    local segs = BOUNCE_SEGS
-    if be >= BOUNCE_TOTAL then
+    local segs = self._bounceSegs
+    if be >= self._bounceTotal then
       self._bounceAt = -1
     else
       local acc, bi = 0, 1
