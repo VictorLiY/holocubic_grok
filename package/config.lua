@@ -20,6 +20,16 @@ return {
 
   hint = "<> switch   ^ spin   v bounce",
 
+  -- WorkBuddy 状态联动（设计见 grok.bot.status.md）
+  wb_status = {
+    enabled = true,          -- false 或 host 为空时纯动画模式（原有行为）
+    host = "192.168.0.112",  -- 跑 wb_status_pc/monitor-server.mjs 的 PC 局域网 IP
+    port = 8788,             -- 服务需 HOST=0.0.0.0 启动（或 --lan）
+    poll_ms = 1000,          -- 轮询间隔
+    log = true,              -- 状态跃迁写 APP_DIR/status.txt（诊断用）
+    -- map = { thinking = "37" },  -- 可选：按状态覆盖默认表情 id
+  },
+
   -- 调试
   snapshot_ms = nil,    -- 设为毫秒数：启动后在 APP_DIR 导出 shot.png
   perf_log = false,     -- 设为 true：每 perf_frames 帧写一行 fps 到 perf.txt

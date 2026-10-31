@@ -12,6 +12,7 @@ local modules = {
   ["grok_ball.lua"] = GROK_BALL,
   ["grok_engine.lua"] = GROK_ENGINE,
   ["config.lua"] = GROK_CONFIG,
+  ["wb_status.lua"] = WB_STATUS,
 }
 
 function dofile(path)

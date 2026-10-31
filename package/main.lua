@@ -6,6 +6,11 @@
 --
 -- 按键：← → 切换表情，↑ 自旋一圈，↓ 弹跳，HOME 退出
 -- 无操作 15 秒后自动巡演全部表情（每 5.2 秒一个）
+--
+-- WorkBuddy 状态联动（设计见 grok.bot.status.md）：
+-- 轮询 PC 上 wb_status_pc/monitor-server.mjs 的 /api/holo，
+-- idle/thinking/working/standby/error → 专属表情 + 动效；
+-- 服务不可达时自动降级回纯动画模式。
 
 local APP_DIR = "/sd/apps/grok_bot"
 
@@ -52,6 +57,12 @@ end
 local Ball = dofile(APP_DIR .. "/grok_ball.lua")
 local Engine = dofile(APP_DIR .. "/grok_engine.lua")
 
+-- WorkBuddy 状态联动模块（缺失/损坏时 WB=nil，纯动画降级）
+local ok_wb, WB = pcall(dofile, APP_DIR .. "/wb_status.lua")
+if not ok_wb or type(WB) ~= "table" or type(WB.init) ~= "function" then
+  WB = nil
+end
+
 local ok_cfg, config = pcall(dofile, APP_DIR .. "/config.lua")
 if not ok_cfg or type(config) ~= "table" then
   config = {}
@@ -67,6 +78,12 @@ local APP = {
   tour_next = 0,
   tour_idx = 1,      -- 巡演游标（engine.list 的下标），显式维护，避免被表情自身跳转带偏
   shown_id = nil,
+  -- WorkBuddy 状态联动
+  wb = nil,          -- wb_status 实例
+  wb_active = false, -- true 期间状态驱动接管：巡演挂起、HUD 归状态层
+  user_hold_until = 0, -- 用户按键后 60s 内状态层不抢表情（人工优先）
+  wb_trace = nil,    -- 离线测试轨迹（PREVIEW 环境自动开启）
+  wb_log = nil,      -- status.txt 诊断日志（config.wb_status.log）
 }
 _G.__grok_bot = APP
 
@@ -88,6 +105,14 @@ local function set_hint(text, color)
   if not hint then return end
   pcall(lv_label_set_text, hint, text)
   if color then pcall(lv_obj_set_style_text_color, hint, color, MAIN_STYLE) end
+end
+
+-- 用户按键：除了刷新"无操作计时"，还让用户在 60s 内保有表情控制权
+-- （状态层只挂起不抢表情，见 wb_status 的 paused 回调）
+local function user_touch()
+  local now = millis_now()
+  APP.last_input = now
+  APP.user_hold_until = now + 60000
 end
 
 local function index_of(id)
@@ -127,6 +152,11 @@ end
 function APP.stop(reason)
   if APP.stopped then return end
   APP.stopped = true
+  -- 先停网络轮询（代际号防在途回调），再收 UI
+  if APP.wb then
+    pcall(function() APP.wb.shutdown() end)
+    APP.wb = nil
+  end
   if timer then
     pcall(function() timer:unregister() end)
     timer = nil
@@ -193,8 +223,8 @@ local function frame()
 
   ball:render(pose, now, engine._dt)
 
-  -- HUD：前几秒显示操作提示，之后显示当前序号
-  if hint then
+  -- HUD：前几秒显示操作提示，之后显示当前序号（状态层接管时让位给状态 HUD）
+  if hint and not APP.wb_active then
     local def = engine:emotion()
     if now - start_ms >= 4500 and APP.shown_id ~= def.id then
       APP.shown_id = def.id
@@ -289,21 +319,21 @@ local function start()
 
   if key and key.on then
     pcall(key.on, key.LEFT, function(evt)
-      if evt == key.SHORT then step(-1, true) end
+      if evt == key.SHORT then user_touch() step(-1, true) end
     end)
     pcall(key.on, key.RIGHT, function(evt)
-      if evt == key.SHORT then step(1, true) end
+      if evt == key.SHORT then user_touch() step(1, true) end
     end)
     pcall(key.on, key.UP, function(evt)
       if evt == key.SHORT and engine then
         engine:spin(1)
-        APP.last_input = millis_now()
+        user_touch()
       end
     end)
     pcall(key.on, key.DOWN, function(evt)
       if evt == key.SHORT and engine then
         engine:bounce()
-        APP.last_input = millis_now()
+        user_touch()
       end
     end)
     pcall(key.on, key.HOME, function(evt)
@@ -313,6 +343,75 @@ local function start()
 
   timer = tmr.create()
   timer:alarm(config.interval or 40, tmr.ALARM_AUTO, tick)
+
+  -- ------------------------------------------------ WorkBuddy 状态联动
+  -- 回调适配层：wb_status 只做状态推导，表情/HUD/巡演挂起在这里落地
+  local cwb = config.wb_status or {}
+  if WB and cwb.enabled and cwb.host and cwb.host ~= "" then
+    -- 诊断日志：状态跃迁写 APP_DIR/status.txt（保留最近 200 行）
+    if cwb.log then
+      APP.wb_log = {}
+    end
+    -- 离线测试（PREVIEW 环境）自动记录表情应用轨迹
+    if rawget(_G, "PREVIEW") then
+      APP.wb_trace = {}
+    end
+
+    local function wb_log(line)
+      local lines = APP.wb_log
+      lines[#lines + 1] = string.format("[%d] %s",
+        math.floor((millis_now() - (start_ms or 0)) / 1000), tostring(line))
+      while #lines > 200 do table.remove(lines, 1) end
+      write_text(APP_DIR .. "/status.txt", table.concat(lines, "\n") .. "\n")
+    end
+
+    APP.wb = WB.init({
+      host = cwb.host,
+      port = cwb.port or 8787,
+      path = cwb.path or "/api/holo",
+      poll_ms = cwb.poll_ms or 1000,
+      map = cwb.map,
+      idle_tour = cwb.idle_tour,
+    }, {
+      apply = function(emo, fx)
+        if not engine or APP.stopped then return end
+        engine:set_emotion(emo)
+        APP.tour_idx = index_of(emo)
+        if fx == "spin" then
+          engine:spin(1)
+        elseif fx == "bounce" then
+          engine:bounce()
+        end
+        if APP.wb_trace then
+          APP.wb_trace[#APP.wb_trace + 1] = emo .. "@" .. math.floor(millis_now() / 1000) .. "s"
+        end
+      end,
+      fx = function(kind)
+        if not engine or APP.stopped then return end
+        if kind == "bounce" then engine:bounce() end
+      end,
+      hud = function(text, color)
+        set_hint(tostring(text or ""), color)
+      end,
+      hold = function(on)
+        -- 状态层接管：巡演顺延（tour_next=∞，不改游标）；释放则按步长恢复
+        APP.wb_active = on and true or false
+        if not engine then return end
+        if on then
+          APP.tour_next = math.huge
+        else
+          APP.tour_next = millis_now() + (config.tour_step or 5200)
+        end
+      end,
+      paused = function()
+        return millis_now() < APP.user_hold_until
+      end,
+      log = APP.wb_log and wb_log or nil,
+    })
+    if not APP.wb and APP.wb_log then
+      wb_log("wb init failed: http api missing or bad config")
+    end
+  end
 end
 
 pcall(math.randomseed, millis() % 100000)

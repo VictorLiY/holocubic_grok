@@ -117,11 +117,12 @@ function writePng(file, raw, w, h) {
 /* ---------------- 装配 ---------------- */
 const W = 320, H = 240;
 const tourMode = args.tour !== undefined;
+const wbMode = args.wb !== undefined;
 
 loadAs(path.join(HERE, 'preview_canvas.lua'));
 
-if (tourMode) {
-  /* 巡演模拟不需要像素：摘掉 canvas 绘制接口，Ball:render 会直接返回 */
+if (tourMode || wbMode) {
+  /* 巡演/状态机模拟不需要像素：摘掉 canvas 绘制接口，Ball:render 会直接返回 */
   for (const name of ['lv_canvas_draw_rect', 'lv_canvas_draw_line', 'lv_canvas_draw_arc',
     'lv_canvas_draw_text', 'lv_canvas_fill_bg', 'lv_canvas_set_px_color']) {
     lua.lua_pushnil(L);
@@ -133,6 +134,7 @@ loadAs(path.join(PKG, 'grok_data.lua'), 'GROK_DATA');
 loadAs(path.join(PKG, 'grok_ball.lua'), 'GROK_BALL');
 loadAs(path.join(PKG, 'grok_engine.lua'), 'GROK_ENGINE');
 loadAs(path.join(PKG, 'config.lua'), 'GROK_CONFIG');
+loadAs(path.join(PKG, 'wb_status.lua'), 'WB_STATUS');
 
 lua.lua_newtable(L);
 const setField = (k, v) => {
@@ -146,8 +148,8 @@ setField('dt', Number(args.dt || 33));
 if (args.action) setField('action', args.action);
 if (args.at) setField('at', Number(args.at));
 if (args.aa !== undefined) setField('aa', Number(args.aa));
-if (tourMode) {
-  setField('seconds', Number(args.tour));
+if (tourMode || wbMode) {
+  setField('seconds', Number(args.tour !== undefined ? args.tour : args.wb));
   setField('main_source', fs.readFileSync(path.join(PKG, 'main.lua'), 'utf8'));
 }
 lua.lua_setglobal(L, to_luastring('PREVIEW_ARGS'));
@@ -162,6 +164,17 @@ if (tourMode) {
   console.log(`tour ${args.tour}s: ${count} 次切换`);
   console.log(log.replace(/ /g, '  '));
   process.exit(0);
+}
+
+if (wbMode) {
+  loadAs(path.join(HERE, 'wb_driver.lua'));
+  lua.lua_getglobal(L, to_luastring('PREVIEW'));
+  lua.lua_getfield(L, -1, to_luastring('wb_report'));
+  const report = toJs(lua.lua_tostring(L, -1));
+  lua.lua_getfield(L, -2, to_luastring('wb_pass'));
+  const pass = lua.lua_toboolean(L, -1);
+  console.log(report);
+  process.exit(pass ? 0 : 1);
 }
 loadAs(path.join(HERE, 'preview_driver.lua'));
 

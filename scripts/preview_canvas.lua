@@ -180,6 +180,7 @@ end
 -- 这些接口：label 上的文字变化正好就是 HUD 里显示的 "id n/32"。
 
 PV.clock = 0                      -- 模拟毫秒时钟
+PV.timers = {}                    -- 活跃定时器（多定时器调度，见 PV.step_time）
 PV.labels = {}                    -- 记录 label 上出现过的文字
 LV_PART_MAIN = 0
 LV_STATE_DEFAULT = 0
@@ -222,15 +223,54 @@ tmr = {
   ALARM_SINGLE = 0,
   now = function() return PV.clock * 1000 end,
   create = function()
-    local handle = { unregister = function() end }
+    local handle = {}
     function handle:alarm(ms, mode, cb)
-      PV.timer_cb = cb
-      PV.timer_ms = ms
+      local rec = { ms = ms, mode = mode, cb = cb, next_at = PV.clock + ms }
+      handle._rec = rec
+      PV.timers[#PV.timers + 1] = rec
+      -- tour 兼容：最后一个 AUTO 定时器视为主渲染循环
+      if mode == tmr.ALARM_AUTO then
+        PV.timer_cb = cb
+        PV.timer_ms = ms
+      end
       return true
+    end
+    function handle:stop()
+      if handle._rec then handle._rec.stopped = true end
+    end
+    function handle:unregister()
+      local rec = handle._rec
+      if rec then
+        for i, r in ipairs(PV.timers) do
+          if r == rec then table.remove(PV.timers, i) break end
+        end
+        handle._rec = nil
+      end
     end
     return handle
   end,
 }
+
+-- 推进模拟时钟 dt 毫秒并触发到期定时器。
+-- 回调里可能增删定时器（如 wb_status 的闪现落点），每轮从头重扫保证安全。
+function PV.step_time(dt)
+  PV.clock = PV.clock + dt
+  local i = 1
+  while i <= #PV.timers do
+    local r = PV.timers[i]
+    if r and not r.stopped and PV.clock >= r.next_at then
+      if r.mode == tmr.ALARM_AUTO then
+        r.next_at = PV.clock + r.ms
+      else
+        table.remove(PV.timers, i)
+      end
+      r.cb()
+      i = 1  -- 重扫
+    else
+      i = i + 1
+    end
+  end
+end
 
 key = {
   SHORT = 1, LEFT = 1, RIGHT = 2, UP = 3, DOWN = 4, HOME = 5,

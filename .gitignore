@@ -4,3 +4,9 @@ __pycache__/
 
 # 离线预览工具的依赖（npm install fengari）
 node_modules/
+
+# 设备端诊断/运行产物（部署后才会生成）
+perf.txt
+status.txt
+error.txt
+shot.png

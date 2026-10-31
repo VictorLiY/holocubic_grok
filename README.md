@@ -18,6 +18,30 @@
 | 情绪反应 | 10 开心 · 11 疑惑 · 12 失落 · 13 惊讶 · 14 害羞 · 15 疲惫 · 16 专注 · 17 慌张 · 18 无奈 · 19 满意 · 20 困惑 · 21 生气 | 12 |
 | 代理状态 | 30 思考中 · 31 接收任务 · 32 处理中 · 33 任务完成 · 34 出错 · 35 等待输入 · 36 联网加载 · 37 复述回忆 · 38 拒绝 · 39 输出回复 · 40 检索资料 · 41 停止终止 | 12 |
 
+### WorkBuddy 状态联动
+
+小球可以实时显示 **WorkBuddy（AI 编程助手）** 的工作状态，设计文档见 [`grok.bot.status.md`](grok.bot.status.md)。
+
+链路：WorkBuddy 会话轨迹（`~/.workbuddy/projects/`）→ PC 上运行的状态监控服务（`wb_status_pc/monitor-server.mjs`）→ 设备每秒轮询 `GET /api/holo` → 切换表情。
+
+| WorkBuddy 状态 | 表情 | 附加动效 |
+| --- | --- | --- |
+| `idle` 空闲 | 02 待机放空 | 2 分钟后 06 休眠、5 分钟后 00 睡眠 |
+| `thinking` 推理 | 30 思考中 | — |
+| `working` 执行 | 32 处理中忙碌 | 进入时自旋一圈；detail 含"检索/搜索/抓取"切 40、含"规划任务"切 30 |
+| `standby` 回复完等你 | 33 任务完成 **闪现 2.5s** → 35 等待输入 | 撒彩带 + 弹跳，之后每 8s 弹跳提醒 |
+| `error` 出错 | 34 出错 | — |
+| 会话切换 | 31 接收任务 闪现 1.5s | — |
+| 服务不可达 | 36 联网加载一次后 | 自动降级回纯动画巡演 |
+
+使用方法：
+
+1. PC 上启动监控服务并开放局域网（首次会弹防火墙确认，点允许）：
+   `HOST=0.0.0.0 node wb_status_pc/monitor-server.mjs`（或加 `--lan`）
+2. `config.lua` 的 `wb_status.host` 填 PC 的局域网 IP，`port` 对应服务端口（默认 8788）。
+3. 用户按键切表情后的 60 秒内状态不会抢屏幕（人工优先）；断链 3 次自动退回纯动画模式。
+4. 诊断：状态跃迁记录在设备 `/sd/apps/grok_bot/status.txt`（`config.wb_status.log` 控制）。
+
 ### 动画机制
 
 - **逐点弹簧形变**：25 组眼睛轮廓，每组左右各 48 个点。换眼神时不是直接替换图形，而是每个点各自用二阶弹簧追目标点，形变过程中会自然过冲、回弹。
@@ -111,6 +135,11 @@ curl -X POST "http://$DEV/devtools/api/apps/rescan"   # 让 launcher 重新扫�
 | `tour_step` | `5200` | 每个表情停留多久（ms），32 个一轮约 2.8 分钟 |
 | `tour_delay` | `15000` | 仅 `autoplay = false` 时生效：无操作多久后开始轮播（ms） |
 | `hint` | `<> switch   ^ spin   v bounce` | 启动时底部提示文字，4.5 秒后自动换成 `当前 id / 32` |
+| `wb_status.enabled` | `true` | WorkBuddy 状态联动总开关；`false` 或 host 为空时纯动画 |
+| `wb_status.host` | — | 状态监控服务所在 PC 的局域网 IP |
+| `wb_status.port` | `8788` | 状态监控服务端口 |
+| `wb_status.poll_ms` | `1000` | 轮询间隔 |
+| `wb_status.log` | `true` | 状态跃迁写 `status.txt`（诊断用） |
 | `snapshot_ms` | `nil` | 调试：设为毫秒数，启动后把屏幕导出为 `shot.png` |
 | `perf_log` | `false` | 调试：每 `perf_frames` 帧往 `perf.txt` 写一行 fps |
 | `perf_frames` | `200` | 调试：性能统计窗口帧数 |
@@ -118,22 +147,31 @@ curl -X POST "http://$DEV/devtools/api/apps/rescan"   # 让 launcher 重新扫�
 
 ## 目录结构
 
+GitHub 发布仓库（holocubic_grok）以本 app 为根，另含 PC 侧配套服务：
+
 ```
-grok_bot/
+holocubic_grok/
 ├── package/            # 需要部署到设备的内容
 │   ├── app.info        # 应用元信息（名称、分类、入口、图标）
 │   ├── config.lua      # 用户配置
-│   ├── main.lua        # 应用外壳：canvas、主循环、按键、巡演、调试钩子
+│   ├── main.lua        # 应用外壳：canvas、主循环、按键、巡演、WorkBuddy 状态接入
 │   ├── grok_engine.lua # 驱动层：姿态合成、弹簧、眨眼、表情池、序列、过渡
 │   ├── grok_ball.lua   # 绘制层：球体、球面投影眼睛、zzz、撒花
 │   ├── grok_data.lua   # 生成数据：25 组眼环 + 32 套表情（42KB）
+│   ├── wb_status.lua   # WorkBuddy 状态轮询：/api/holo → 表情映射/闪现/降级
 │   └── main.png        # 128×128 图标
 ├── scripts/
 │   ├── gen_data.mjs    # 从上游 grok-ball.js 抽取几何/情绪数据生成 grok_data.lua
 │   ├── gen_icon.py     # 生成图标
 │   ├── preview.mjs     # 离线预览：Node + fengari 跑真实渲染代码，导出 PNG
 │   ├── preview_canvas.lua  # 预览用的 canvas 打桩实现（纯 Lua 光栅化）
-│   └── preview_driver.lua  # 预览驱动脚本
+│   ├── preview_driver.lua  # 预览驱动脚本
+│   ├── tour_driver.lua     # 巡演调度回归驱动（--tour）
+│   └── wb_driver.lua       # WorkBuddy 状态机回归驱动（--wb）
+├── wb_status_pc/       # PC 侧 WorkBuddy 状态监控服务（配套，见 grok.bot.status.md）
+├── sync.sh             # 从开发工作区同步最新代码到本仓库
+├── grok.bot.status.md  # WorkBuddy 状态联动设计文档
+├── grok.bot.design.md  # 语音对话设计稿
 ├── preview.png
 └── README.md
 ```
@@ -189,13 +227,14 @@ node scripts/preview.mjs --emotion=02 --frames=7 --action=bounce --at=1   # 抓�
 
 可选参数：`--emotion=<id>`、`--frames=<n>`、`--dt=<ms>`、`--aa=0|1`、`--action=spin|bounce --at=<frame>`。
 
-另外还能端到端验证巡演调度（会真的加载 `package/main.lua`，用打桩的 `tmr`/`millis` 推时钟，只跳过像素绘制）：
+另外还能端到端验证调度（会真的加载 `package/main.lua`，用打桩的 `tmr`/`millis`/`http` 推时钟，只跳过像素绘制）：
 
 ```bash
-node scripts/preview.mjs --tour=400     # 模拟 400 秒，打印每个表情出现的时间点
+node scripts/preview.mjs --tour=400     # 巡演回归：模拟 400 秒，打印每个表情出现的时间点
+node scripts/preview.mjs --wb=45        # WorkBuddy 状态机回归：剧本驱动全部状态跃迁/闪现/离线降级
 ```
 
-正常情况下输出应是 `00 01 02 … 07 10 … 41 00 …` 严格按顺序、每个约 5.2 秒、跑满 32 个再从头开始。
+`--tour` 正常输出应是 `00 01 02 … 07 10 … 41 00 …` 严格按顺序、每个约 5.2 秒、跑满 32 个再从头开始；`--wb` 应输出 13 步表情轨迹并以 `PASS` 结束。
 
 ## 与原版的差异
 
